@@ -2,7 +2,7 @@
 ; To release a new version, bump MyAppVersion (and version_info.txt).
 
 #define MyAppName "LAN Chat"
-#define MyAppVersion "1.0.2"
+#define MyAppVersion "1.0.6"
 #define MyAppPublisher "LAN Chat"
 #define MyAppExeName "LANChat.exe"
 
@@ -50,7 +50,7 @@ Source: "dist\LANChat\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
-Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: autostart
+Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--minimized"; Tasks: autostart
 
 [Run]
 ; Firewall: allow inbound on Private/Domain networks only

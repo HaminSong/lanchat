@@ -237,6 +237,7 @@ class Node:
         cfg["desk"].setdefault("note", "")
         cfg.setdefault("web", {})
         cfg.setdefault("reads", {})
+        cfg.setdefault("cleared", {})
         return cfg
 
     def _save_cfg(self):
@@ -259,10 +260,15 @@ class Node:
                 if not mid:
                     continue
                 if mid in self.by_mid:
+                    n = self.by_mid[mid]["n"]
                     self.by_mid[mid].update(rec)
+                    self.by_mid[mid]["n"] = n
                 else:
-                    self.seq += 1
-                    rec["n"] = self.seq
+                    if isinstance(rec.get("n"), int) and rec["n"] > self.seq:
+                        self.seq = rec["n"]          # 저장된 번호 유지 (삭제 후에도 번호가 밀리지 않게)
+                    else:
+                        self.seq += 1
+                        rec["n"] = self.seq
                     self.messages.append(rec)
                     self.by_mid[mid] = rec
         for m in self.messages:
@@ -294,9 +300,15 @@ class Node:
         return dst
 
     def _append_log(self, m):
-        rec = {k: v for k, v in m.items() if k != "n"}
         with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.write(json.dumps(m, ensure_ascii=False) + "\n")
+
+    def _rewrite_log(self):
+        tmp = self.log_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for m in self.messages:
+                f.write(json.dumps(m, ensure_ascii=False) + "\n")
+        os.replace(tmp, self.log_path)
 
     # ------------------------------------------------------------ users
     def _local_users(self, include_stale=False):
@@ -345,12 +357,20 @@ class Node:
     def display_name(self, uid):
         return self.user_info(uid)["name"]
 
+    def _cut(self, uid, peer):
+        return self.cfg["cleared"].get(uid, {}).get(peer, 0)
+
     def contacts_for(self, uid):
         with self.lock:
             users = {u["uid"]: dict(u) for u in self._all_users() if u["uid"] != uid}
             reads = self.cfg["reads"].get(uid, {})
+            cleared = self.cfg["cleared"].get(uid, {})
             unread, recent = {}, {}
             for m in self.messages:
+                if uid not in (m["frm"], m["to"]):
+                    continue
+                if m["n"] <= cleared.get(m["to"] if m["frm"] == uid else m["frm"], 0):
+                    continue
                 if m["to"] == uid:
                     o = m["frm"]
                     recent[o] = m.get("frm_name")
@@ -418,9 +438,52 @@ class Node:
 
     def history(self, uid, peer):
         with self.lock:
+            cut = self._cut(uid, peer)
             out = [m for m in self.messages
-                   if (m["frm"] == uid and m["to"] == peer) or (m["frm"] == peer and m["to"] == uid)]
+                   if m["n"] > cut and ((m["frm"] == uid and m["to"] == peer) or (m["frm"] == peer and m["to"] == uid))]
             return out[-HISTORY_LIMIT:]
+
+    def clear_chat(self, uid, peer):
+        """uid의 화면에서 peer와의 대화를 삭제. 이 PC에 기록된 모든 당사자가 지운 메시지는 파일에서도 제거."""
+        with self.lock:
+            cut = 0
+            for m in self.messages:
+                if {m["frm"], m["to"]} == {uid, peer}:
+                    cut = max(cut, m["n"])
+            if not cut:
+                return
+            self.cfg["cleared"].setdefault(uid, {})[peer] = cut
+            self.cfg["reads"].setdefault(uid, {})[peer] = max(self.cfg["reads"].get(uid, {}).get(peer, 0), cut)
+            keep, removed = [], []
+            for m in self.messages:
+                locals_ = [p for p in (m["frm"], m["to"]) if node_of(p) == self.node_id]
+                gone = m.get("st") != "pending" and locals_ and all(
+                    self._cut(p, m["to"] if p == m["frm"] else m["frm"]) >= m["n"] for p in locals_)
+                (removed if gone else keep).append(m)
+            if removed:
+                self.messages = keep
+                for m in removed:
+                    self.by_mid.pop(m["mid"], None)
+                    if m.get("type") == "file":
+                        meta = self.files.pop(m["fid"], None)
+                        self.findex.pop(m["fid"], None)
+                        cache = os.path.join(self.files_dir, m["fid"])
+                        if os.path.isdir(cache):          # 임시 보관 파일만 삭제 (문서 폴더 파일은 유지)
+                            shutil.rmtree(cache, ignore_errors=True)
+                self._rewrite_log()
+                self._set_file_index()
+            self._save_cfg()
+            data = json.dumps({"t": "cleared", "peer": peer}, ensure_ascii=False)
+            for s in list(self.subs):
+                if s.uid == uid:
+                    s.q.put(data)
+            self._bump()
+
+    def _set_file_index(self):
+        tmp = self.findex_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.findex, f, ensure_ascii=False)
+        os.replace(tmp, self.findex_path)
 
     def client_connected(self, sub, delta):
         with self.lock:
@@ -958,6 +1021,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/profile":
                 node.update_profile(uid, self._body_json() or {})
                 self._json({"ok": True})
+            elif path == "/api/clear":
+                data = self._body_json() or {}
+                node.clear_chat(uid, str(data.get("peer", ""))[:80])
+                self._json({"ok": True})
             elif path == "/api/read":
                 data = self._body_json() or {}
                 node.mark_read(uid, str(data.get("peer", "")))
@@ -1004,6 +1071,38 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ====================================================================== desktop
+def run_detached(cmd):
+    """콘솔 없는 exe(--windowed)에서도 동작하도록 입출력을 모두 닫고 실행"""
+    kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
+    if os.name == "nt":
+        kw["creationflags"] = 0x08000000   # CREATE_NO_WINDOW
+    return subprocess.Popen(cmd, **kw)
+
+
+def reveal_in_explorer(path):
+    """탐색기에서 파일이 있는 폴더를 열고 그 파일을 선택"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        shell32, ole32 = ctypes.windll.shell32, ctypes.windll.ole32
+        ole32.CoInitialize(None)
+        shell32.SHParseDisplayName.argtypes = [wintypes.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+                                               wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
+        shell32.SHOpenFolderAndSelectItems.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p, wintypes.DWORD]
+        ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+        pidl = ctypes.c_void_p()
+        if shell32.SHParseDisplayName(path, None, ctypes.byref(pidl), 0, None) != 0:
+            raise OSError("SHParseDisplayName failed")
+        try:
+            if shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0) != 0:
+                raise OSError("SHOpenFolderAndSelectItems failed")
+        finally:
+            ole32.CoTaskMemFree(pidl)
+    except Exception:
+        log.exception("reveal via shell API failed, falling back to explorer")
+        run_detached(["explorer", "/select,", path])
+
+
 class DeskApi:
     """JS에서 window.pywebview.api.* 로 호출"""
 
@@ -1022,14 +1121,29 @@ class DeskApi:
     def open_recv_dir(self):
         self._app.open_recv_dir()
 
+    def toast_open(self, peer):
+        self._app.toast_open(str(peer))
+
+    def toast_close(self):
+        self._app.close_toast()
+
 
 class DesktopApp:
-    def __init__(self, node):
+    def __init__(self, node, start_hidden=False):
         self.node = node
         self.wins = {}
         self.wlock = threading.Lock()
         self.main = None
         self.webview = None
+        self.tray = None
+        self.start_hidden = start_hidden
+        self.quitting = False
+        self.toast = None
+        self.toast_lock = threading.Lock()
+        self.unread = 0
+
+    def t(self, ko, en):
+        return ko if self.node.desk_korean() else en
 
     def run(self):
         import webview
@@ -1039,16 +1153,83 @@ class DesktopApp:
         except Exception:
             pass
         self.api = DeskApi(self)
-        self.main = webview.create_window("LAN Chat", self.node.desk_url(view="list"), js_api=self.api,
-                                          width=340, height=620, min_size=(280, 420))
-        self.main.events.closed += self._main_closed
+        self._start_tray()
+        hidden = self.start_hidden and self.tray is not None
+        self.main = self._create("LAN Chat", self.node.desk_url(view="list"),
+                                 width=340, height=620, min_size=(280, 420), hidden=hidden)
+        if self.tray is not None:
+            self.main.events.closing += self._main_closing   # 닫기 → 트레이로 숨김
+        self.main.events.closed += self.quit
         self.node.on_incoming = self._incoming
         self.node.native = True
+        threading.Thread(target=self._unread_loop, daemon=True).start()
         webview.start()
-        self._main_closed()
+        self.quit()
 
-    def _main_closed(self):
-        self.node.stop()
+    # ---------------------------------------------------------- tray (백그라운드 실행)
+    def _start_tray(self):
+        try:
+            import pystray
+            from PIL import Image
+        except Exception:
+            log.warning("pystray/Pillow 없음 → 창을 닫으면 종료됩니다")
+            return
+        image = Image.open(io.BytesIO(ICON_PNG))
+        menu = pystray.Menu(
+            pystray.MenuItem(lambda item: self.t("LAN Chat 열기", "Open LAN Chat"),
+                             lambda icon, item: self.show_main(), default=True),
+            pystray.MenuItem(lambda item: self.t("받은 파일 폴더", "Received files"),
+                             lambda icon, item: self.open_recv_dir()),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(lambda item: self.t("종료", "Quit"), lambda icon, item: self.quit()),
+        )
+        self.tray = pystray.Icon("LANChat", image, "LAN Chat", menu)
+        threading.Thread(target=self.tray.run, daemon=True).start()
+
+    def _notify(self, text):
+        if self.tray is not None:
+            try:
+                self.tray.notify(text[:200], "LAN Chat")
+            except Exception:
+                pass
+
+    def _main_closing(self):
+        if self.quitting or self._windows_shutting_down():
+            self.quitting = True
+            return True
+        threading.Thread(target=self._hide_main, daemon=True).start()
+        return False   # 창 닫기 취소 → 대신 숨김
+
+    @staticmethod
+    def _windows_shutting_down():
+        try:
+            import ctypes
+            return bool(ctypes.windll.user32.GetSystemMetrics(0x2000))  # SM_SHUTTINGDOWN
+        except Exception:
+            return False
+
+    def _hide_main(self):
+        try:
+            self.main.hide()
+        except Exception:
+            pass
+        if not self.node.cfg.get("tray_hint"):
+            self.node.cfg["tray_hint"] = True
+            self.node._save_cfg()
+            self._notify(self.t("LAN Chat은 트레이에서 계속 실행 중입니다. 종료하려면 트레이 아이콘을 오른쪽 클릭하세요.",
+                                "LAN Chat is still running in the tray. Right-click the tray icon to quit."))
+
+    def quit(self):
+        self.quitting = True
+        try:
+            self.node.stop()
+        except Exception:
+            pass
+        if self.tray is not None:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
         os._exit(0)
 
     def show_main(self):
@@ -1068,10 +1249,12 @@ class DesktopApp:
             pass
 
     def _create(self, title, url, **kw):
+        kw.setdefault("text_select", True)   # 드래그로 텍스트 선택/복사 허용
         try:
             return self.webview.create_window(title, url, js_api=self.api, **kw)
         except TypeError:
-            kw.pop("focus", None)
+            for k in ("focus", "text_select", "hidden"):
+                kw.pop(k, None)
             return self.webview.create_window(title, url, js_api=self.api, **kw)
 
     def open_chat(self, peer, focus=True):
@@ -1093,15 +1276,116 @@ class DesktopApp:
             self._front(w)
 
     def _incoming(self, m):
+        """새 메시지: 대화창을 띄우지 않고 오른쪽 아래 알림 팝업 + 알림음 (카카오톡 방식)"""
         if m.get("to") != self.node.node_id:
             return
-        if self.node.cfg["desk"].get("status") != "busy":
+        if self.node.cfg["desk"].get("status") == "busy":   # 다른 용무 중 = 알림 끔
+            return
+        with self.wlock:
+            chat_open = m["frm"] in self.wins
+        try:
+            import winsound
+            winsound.PlaySound("SystemNotification", winsound.SND_ALIAS | winsound.SND_ASYNC)
+        except Exception:
+            pass
+        if not chat_open:
+            threading.Thread(target=self.show_toast, args=(m,), daemon=True).start()
+
+    # ---------------------------------------------------------- 알림 팝업
+    def _toast_geometry(self, w, h):
+        try:
+            scr = self.webview.screens[0]
+            sx, sy, sw, sh = scr.x, scr.y, scr.width, scr.height
+        except Exception:
+            sx, sy, sw, sh = 0, 0, 1280, 720
+        right, bottom = sx + sw, sy + sh - 48
+        try:
+            import ctypes
+            from ctypes import wintypes
+            rect = wintypes.RECT()
+            ctypes.windll.user32.SystemParametersInfoW(0x30, 0, ctypes.byref(rect), 0)   # SPI_GETWORKAREA
+            cx = ctypes.windll.user32.GetSystemMetrics(0)
+            cy = ctypes.windll.user32.GetSystemMetrics(1)
+            if cx and cy:   # 작업 영역을 화면 비율로 환산 (DPI 단위 차이와 무관)
+                right = sx + sw * rect.right / cx
+                bottom = sy + sh * rect.bottom / cy
+        except Exception:
+            pass
+        return int(right - w - 12), int(bottom - h - 12)
+
+    def show_toast(self, m):
+        import html as H
+        name = m.get("frm_name") or "?"
+        body = m.get("text") if m.get("type") == "text" else "📎 " + str(m.get("fname", ""))
+        hue = 0
+        for ch in m["frm"]:
+            hue = (hue * 31 + ord(ch)) & 0xFFFFFFFF
+        hue %= 360
+        page = TOAST_HTML.replace("__NAME__", H.escape(name)).replace("__BODY__", H.escape(body or "")) \
+            .replace("__INITIAL__", H.escape(name.strip()[:1].upper() or "?")).replace("__HUE__", str(hue)) \
+            .replace("__PEER__", json.dumps(m["frm"])).replace("__APP__", "LAN Chat")
+        w, h = 340, 96
+        x, y = self._toast_geometry(w, h)
+        with self.toast_lock:
+            old, self.toast = self.toast, None
+            if old is not None:
+                try:
+                    old.destroy()
+                except Exception:
+                    pass
             try:
-                import winsound
-                winsound.PlaySound("SystemNotification", winsound.SND_ALIAS | winsound.SND_ASYNC)
+                self.toast = self.webview.create_window(
+                    "LAN Chat", html=page, js_api=self.api, width=w, height=h, x=x, y=y,
+                    frameless=True, on_top=True, focus=False, resizable=False, text_select=False)
+            except TypeError:
+                self.toast = self.webview.create_window(
+                    "LAN Chat", html=page, js_api=self.api, width=w, height=h, x=x, y=y,
+                    frameless=True, on_top=True, resizable=False)
+
+    def close_toast(self):
+        with self.toast_lock:
+            t, self.toast = self.toast, None
+        if t is not None:
+            try:
+                t.destroy()
             except Exception:
                 pass
-        threading.Thread(target=self.open_chat, args=(m["frm"], False), daemon=True).start()
+
+    def toast_open(self, peer):
+        self.close_toast()
+        self.open_chat(peer, focus=True)
+
+    # ---------------------------------------------------------- 안 읽은 메시지 표시 (트레이)
+    def _unread_loop(self):
+        while True:
+            try:
+                n = sum(c.get("unread", 0) for c in self.node.contacts_for(self.node.node_id))
+                if n != self.unread:
+                    self.unread = n
+                    self._update_badge(n)
+            except Exception:
+                log.exception("unread")
+            time.sleep(1)
+
+    def _update_badge(self, n):
+        title = "LAN Chat" + (" (%d)" % n if n else "")
+        try:
+            if self.main:
+                self.main.set_title(title)
+        except Exception:
+            pass
+        if self.tray is None:
+            return
+        try:
+            from PIL import Image, ImageDraw
+            img = Image.open(io.BytesIO(ICON_PNG)).convert("RGBA").resize((64, 64))
+            if n:
+                d = ImageDraw.Draw(img)
+                d.ellipse([34, 0, 63, 29], fill=(235, 64, 52, 255), outline=(255, 255, 255, 255), width=3)
+            self.tray.icon = img
+            self.tray.title = title
+        except Exception:
+            log.exception("badge")
 
     def open_recv_dir(self):
         d = self.node.recv_dir
@@ -1110,7 +1394,7 @@ class DesktopApp:
             if os.name == "nt":
                 os.startfile(d)
             else:
-                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", d])
+                run_detached(["open" if sys.platform == "darwin" else "xdg-open", d])
         except Exception:
             log.exception("open_recv_dir")
 
@@ -1122,13 +1406,13 @@ class DesktopApp:
         try:
             if os.name == "nt":
                 if reveal:
-                    subprocess.Popen(["explorer", "/select,", path])
+                    reveal_in_explorer(path)
                 else:
                     os.startfile(path)
             elif sys.platform == "darwin":
-                subprocess.Popen(["open", "-R", path] if reveal else ["open", path])
+                run_detached(["open", "-R", path] if reveal else ["open", path])
             else:
-                subprocess.Popen(["xdg-open", os.path.dirname(path) if reveal else path])
+                run_detached(["xdg-open", os.path.dirname(path) if reveal else path])
         except Exception:
             log.exception("open_file")
 
@@ -1192,6 +1476,7 @@ def main():
     ap.add_argument("--udp-port", type=int, default=UDP_PORT)
     ap.add_argument("--peer", action="append", default=[], help="브로드캐스트가 막힌 망에서 직접 지정: IP[:UDP포트]")
     ap.add_argument("--lock-port", type=int, default=LOCK_PORT)
+    ap.add_argument("--minimized", action="store_true", help="트레이에 숨긴 상태로 시작 (자동 실행용)")
     args = ap.parse_args()
 
     data_dir = args.data or default_data_dir()
@@ -1248,7 +1533,7 @@ def main():
             use_window = False
 
     if use_window:
-        app = DesktopApp(node)
+        app = DesktopApp(node, start_hidden=args.minimized)
         threading.Thread(target=lock_listener, args=(lock, app.show_main), daemon=True).start()
         app.run()
         return
@@ -1275,6 +1560,35 @@ MANIFEST = json.dumps({
     "icons": [{"src": "/icon.png", "sizes": "192x192", "type": "image/png"}],
 }, ensure_ascii=False)
 
+TOAST_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><style>
+:root{--bg:#ffffff;--text:#1d1f23;--muted:#737a85;--line:#dfe2e7}
+@media (prefers-color-scheme: dark){:root{--bg:#23262d;--text:#eceef2;--muted:#9aa1ab;--line:#353942}}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--text);
+  font-family:"Segoe UI","Malgun Gothic",sans-serif;-webkit-user-select:none;user-select:none;cursor:pointer}
+body{box-sizing:border-box;border:1px solid var(--line);display:flex;gap:12px;align-items:center;padding:12px 14px}
+.av{flex:none;width:44px;height:44px;border-radius:50%;background:hsl(__HUE__ 55% 52%);color:#fff;font-weight:700;
+  font-size:19px;display:flex;align-items:center;justify-content:center}
+.c{flex:1;min-width:0}
+.n{font-weight:700;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:18px}
+.b{font-size:13px;color:var(--muted);margin-top:2px;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;
+  -webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
+.x{position:absolute;top:6px;right:8px;border:none;background:transparent;color:var(--muted);font-size:16px;cursor:pointer;padding:2px 4px}
+.x:hover{color:var(--text)}
+.bar{position:absolute;left:0;bottom:0;height:3px;background:#3b6ef5;width:100%;transform-origin:left;animation:t 6s linear forwards}
+body:hover .bar{animation-play-state:paused}
+@keyframes t{to{transform:scaleX(0)}}
+</style></head><body>
+<div class="av">__INITIAL__</div>
+<div class="c"><div class="n">__NAME__</div><div class="b">__BODY__</div></div>
+<button class="x" id="x" title="Close">✕</button><div class="bar" id="bar"></div>
+<script>
+const PEER = __PEER__;
+const api = () => window.pywebview && window.pywebview.api;
+document.getElementById('x').addEventListener('click', e => { e.stopPropagation(); api() && api().toast_close(); });
+document.body.addEventListener('click', () => api() && api().toast_open(PEER));
+document.getElementById('bar').addEventListener('animationend', () => api() && api().toast_close());
+</script></body></html>"""
+
 # ====================================================================== page
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -1293,10 +1607,11 @@ PAGE = r"""<!doctype html>
 :root{
   --bg:#f3f4f6; --panel:#ffffff; --text:#1d1f23; --muted:#737a85; --line:#e2e4e8; --hover:#f0f2f5;
   --bubble:#ffffff; --me:#3b6ef5; --accent:#3b6ef5; --on:#22a55b; --away:#e0a100; --busy:#d9443a; --off:#a3a8b0;
+  --chatbg:#dfe7f1; --daybg:rgba(0,0,0,.08);
 }
 @media (prefers-color-scheme: dark){
   :root{ --bg:#15171b; --panel:#1d2026; --text:#e8eaee; --muted:#8c929c; --line:#2d313a; --hover:#262a31;
-         --bubble:#262a31; --accent:#6d93ff; --off:#5d626b; }
+         --bubble:#2c3038; --accent:#6d93ff; --off:#5d626b; --chatbg:#16181d; --daybg:rgba(255,255,255,.07); }
 }
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
@@ -1370,44 +1685,113 @@ body.v-mobile.in-chat #chatPane{display:flex}
 .nobody{color:var(--muted);text-align:center;padding:30px 20px;line-height:1.6;font-size:13px}
 
 /* ---------- chat */
-.chead{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--panel);border-bottom:1px solid var(--line)}
+.chead{position:relative;display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--panel);border-bottom:1px solid var(--line)}
+.hbtn{flex:none;border:none;background:transparent;color:var(--muted);font-size:20px;line-height:1;width:34px;height:34px;border-radius:8px;cursor:pointer}
+.hbtn:hover{background:var(--hover);color:var(--text)}
+.menu{position:absolute;right:12px;top:52px;z-index:30;min-width:190px;background:var(--panel);border:1px solid var(--line);
+  border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.18);padding:6px}
+.menu button{display:block;width:100%;text-align:left;border:none;background:transparent;padding:9px 12px;border-radius:7px;cursor:pointer;font-size:14px}
+.menu button:hover{background:var(--hover)}
+.menu .danger{color:var(--busy)}
+.drawer{position:fixed;inset:0;z-index:35;background:rgba(0,0,0,.35);display:flex;justify-content:flex-end}
+.dpanel{width:min(420px,100%);height:100%;background:var(--panel);display:flex;flex-direction:column;box-shadow:-8px 0 24px rgba(0,0,0,.2)}
+.dhead{display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid var(--line);padding-top:max(12px,env(safe-area-inset-top))}
+.dhead .back{display:block!important}
+.dtitle{font-weight:700;font-size:16px}
+.dbody{flex:1;overflow-y:auto;padding:12px 14px calc(16px + env(safe-area-inset-bottom))}
+.dsec{font-size:12.5px;font-weight:700;color:var(--muted);margin:6px 0 8px}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:18px}
+.grid3 a{display:block;aspect-ratio:1;border-radius:8px;overflow:hidden;background:var(--hover)}
+.grid3 img{width:100%;height:100%;object-fit:cover;display:block}
+.frow{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)}
+.frow .fi{flex:1;min-width:0}
+.frow .fn{font-size:14px}
+.frow .fm{font-size:12px;color:var(--muted);margin-top:2px}
+.frow .facts{margin-top:6px}
+.locbody{font-size:14px;line-height:1.6;margin:8px 0 6px}
+.locbody .path{display:block;margin:8px 0;padding:10px 12px;border-radius:10px;background:var(--hover);font-weight:700;word-break:break-all}
+.locbody ol{padding-left:20px;margin:6px 0}
+.locbody .hint{color:var(--muted);font-size:12.5px}
+.tipbox{border:1px solid var(--accent);border-radius:10px;padding:10px 12px;margin:8px 0 12px;background:color-mix(in srgb,var(--accent) 8%,transparent)}
+.dempty{color:var(--muted);text-align:center;padding:40px 0}
+.mcard .row{display:flex;gap:8px;margin-top:6px}
+.mcard .row button{flex:1;margin-top:0}
+.primary.secondary{background:transparent;color:var(--text);border:1px solid var(--line)}
+.primary.danger{background:var(--busy)}
+
+/* scrollbars */
+:root{--sb:rgba(0,0,0,.22);--sbh:rgba(0,0,0,.38)}
+@media (prefers-color-scheme: dark){:root{--sb:rgba(255,255,255,.18);--sbh:rgba(255,255,255,.32)}}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--sb);border-radius:10px;border:3px solid transparent;background-clip:padding-box;min-height:40px}
+::-webkit-scrollbar-thumb:hover{background:var(--sbh);border:3px solid transparent;background-clip:padding-box}
+::-webkit-scrollbar-button,::-webkit-scrollbar-corner{display:none;width:0;height:0}
+@supports not selector(::-webkit-scrollbar){*{scrollbar-width:thin;scrollbar-color:var(--sb) transparent}}
 .back{border:none;background:transparent;font-size:28px;line-height:1;padding:0 6px 4px 0;cursor:pointer}
 .pinfo{flex:1;min-width:0}
 .pname{font-weight:700;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pstat{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .notice{font-size:12px;color:var(--muted);background:var(--panel);border-bottom:1px solid var(--line);padding:6px 14px}
-.msgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
-.msg{display:flex;flex-direction:column;align-items:flex-start;max-width:80%}
-.msg.me{align-self:flex-end;align-items:flex-end}
-.meta{font-size:11px;color:var(--muted);margin:0 4px 3px}
-.meta .bad{color:var(--busy)}
-.bubble{background:var(--bubble);border:1px solid var(--line);border-radius:14px;padding:8px 12px;
-  white-space:pre-wrap;word-break:break-word;line-height:1.45;font-size:14.5px}
-.me .bubble{background:var(--me);color:#fff;border-color:transparent}
+.msgs{flex:1;overflow-y:auto;padding:10px 12px 14px;display:flex;flex-direction:column;background:var(--chatbg)}
+.msgs,.msgs *{-webkit-user-select:text;user-select:text}
+.bubble ::selection{background:#ffe38a;color:#000}
+
+/* 메시지 한 줄: [프로필] [이름 / 말풍선 + 시간] */
+.msg{display:flex;align-items:flex-start;gap:8px;margin-top:3px;max-width:100%}
+.msg.first{margin-top:12px}
+.msg .pav{flex:none;width:38px;height:38px;border-radius:14px;display:flex;align-items:center;justify-content:center;
+  color:#fff;font-weight:700;font-size:15px;visibility:hidden}
+.msg.first .pav{visibility:visible}
+.msg.me .pav{display:none}
+.mcol{display:flex;flex-direction:column;align-items:flex-start;min-width:0;max-width:calc(100% - 46px)}
+.msg.me{justify-content:flex-end}
+.msg.me .mcol{align-items:flex-end;max-width:100%}
+.pname2{font-size:12.5px;color:var(--text);opacity:.85;margin:0 0 4px 2px;display:none}
+.msg.first:not(.me) .pname2{display:block}
+.line{display:flex;align-items:flex-end;gap:5px;max-width:100%}
+.msg.me .line{flex-direction:row-reverse}
+.side{flex:none;display:flex;flex-direction:column;align-items:flex-start;font-size:10.5px;color:var(--muted);line-height:1.3;padding-bottom:1px;white-space:nowrap}
+.msg.me .side{align-items:flex-end}
+.side .tm{visibility:hidden}
+.msg.last .side .tm{visibility:visible}
+.side .st{color:var(--muted)}
+.side .bad{color:var(--busy)}
+
+.bubble{position:relative;background:var(--bubble);color:var(--text);border-radius:4px 16px 16px 16px;padding:8px 11px;
+  white-space:pre-wrap;word-break:break-word;line-height:1.45;font-size:14.5px;max-width:min(520px, 72vw);min-width:0;
+  box-shadow:0 1px 1px rgba(0,0,0,.06)}
+.msg:not(.first) .bubble{border-radius:16px}
+.msg.me .bubble{background:var(--me);color:#fff;border-radius:16px 4px 16px 16px}
+.msg.me:not(.first) .bubble{border-radius:16px}
+.msg.first:not(.me) .bubble::before{content:"";position:absolute;left:-6px;top:0;border-top:9px solid var(--bubble);border-left:8px solid transparent}
+.msg.first.me .bubble::before{content:"";position:absolute;right:-6px;top:0;border-top:9px solid var(--me);border-right:8px solid transparent}
 .bubble a{color:inherit}
-.imgb{padding:4px}
-.imgb img{display:block;max-width:100%;max-height:300px;border-radius:9px;cursor:pointer}
-.filebox{display:flex;align-items:center;gap:10px;white-space:normal}
-.fic{width:36px;height:36px;border-radius:8px;background:rgba(127,127,127,.18);display:flex;align-items:center;justify-content:center;font-size:18px;flex:none}
+.imgb{padding:0;overflow:hidden;background:transparent!important;box-shadow:none}
+.imgb::before{display:none}
+.imgb img{display:block;max-width:100%;max-height:300px;border-radius:12px;cursor:pointer}
+.filebox{display:flex;align-items:center;gap:10px;white-space:normal;min-width:200px}
+.fic{width:40px;height:40px;border-radius:10px;background:rgba(127,127,127,.18);display:flex;align-items:center;justify-content:center;font-size:19px;flex:none}
 .fn{font-weight:600;word-break:break-all}
 .fs{font-size:12px;opacity:.75}
-.facts{display:flex;gap:6px;margin-top:4px;flex-wrap:wrap}
+.facts{display:flex;gap:6px;margin-top:5px;flex-wrap:wrap}
 .facts button,.facts a{border:1px solid currentColor;background:transparent;border-radius:6px;padding:2px 8px;font-size:12px;
   cursor:pointer;text-decoration:none;color:inherit;opacity:.85}
-.fline{font-size:12px;color:var(--muted);margin:3px 4px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.fline{font-size:11.5px;color:var(--muted);margin:4px 2px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .fline .facts{margin:0}
-.day{align-self:center;font-size:11px;color:var(--muted);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:2px 10px}
+.day{align-self:center;margin:16px 0 4px;font-size:11.5px;color:var(--muted);background:var(--daybg);border-radius:999px;padding:4px 14px}
 .prog{align-self:flex-end;font-size:12px;color:var(--muted);width:60%}
 .bar{height:5px;background:var(--line);border-radius:3px;overflow:hidden;margin-top:4px}
 .bar i{display:block;height:100%;width:0;background:var(--accent)}
 .empty{margin:auto;color:var(--muted);text-align:center;padding:20px;line-height:1.6}
 .composer{display:flex;gap:8px;align-items:flex-end;padding:10px 12px;background:var(--panel);border-top:1px solid var(--line);
   padding-bottom:max(10px,env(safe-area-inset-bottom))}
-.composer textarea{flex:1;resize:none;border:1px solid var(--line);background:var(--bg);border-radius:12px;padding:9px 12px;
+.composer textarea{flex:1;resize:none;overflow-y:hidden;border:1px solid var(--line);background:var(--bg);border-radius:12px;padding:9px 12px;
   font-size:16px;max-height:140px;min-height:40px;outline:none}
 .composer textarea:focus{border-color:var(--accent)}
 .btn{flex:none;height:40px;min-width:40px;border:none;border-radius:12px;cursor:pointer;font-size:14px;padding:0 14px;background:var(--accent);color:#fff}
-.btn.ghost{background:transparent;color:var(--text);border:1px solid var(--line);font-size:19px;padding:0 9px}
+.btn.ghost{background:transparent;color:var(--muted);border:1px solid var(--line);padding:0;width:40px;display:flex;align-items:center;justify-content:center}
+.btn.ghost:hover{color:var(--text);background:var(--hover)}
 
 /* ---------- misc */
 .drop{position:fixed;inset:0;background:rgba(59,110,245,.15);border:3px dashed var(--accent);display:none;align-items:center;
@@ -1443,7 +1827,7 @@ body.v-mobile.in-chat #chatPane{display:flex}
       <input id="meNote" class="plain note" maxlength="60" data-i18n-ph="notePh" spellcheck="false">
     </div>
   </div>
-  <div class="tools" id="deskTools"><button class="tbtn hidden" id="phoneBtn" type="button" data-i18n="phoneBtn"></button><button class="tbtn hidden" id="folderBtn" type="button" data-i18n="folderBtn"></button>
+  <div class="tools" id="deskTools"><button class="tbtn hidden" id="phoneBtn" type="button" data-i18n="phoneBtn"></button><button class="tbtn hidden" id="folderBtn" type="button" data-i18n="folderBtn"></button><button class="tbtn hidden" id="saveLocBtn" type="button" data-i18n="saveLocBtn"></button>
     <select class="tbtn langsel" id="langSel" title="Language"><option value="en">English</option><option value="ko">한국어</option></select></div>
   <div id="contacts" class="contacts"></div>
 </section>
@@ -1455,11 +1839,13 @@ body.v-mobile.in-chat #chatPane{display:flex}
       <button class="back" id="backBtn" type="button">‹</button>
       <div class="av" id="peerAv"></div>
       <div class="pinfo"><div class="pname" id="peerName"></div><div class="pstat" id="peerStat"></div></div>
+      <button class="hbtn" id="menuBtn" type="button" title="More">⋯</button>
+      <div class="menu hidden" id="chatMenu"><button type="button" id="filesBtn" data-i18n="filesMenu"></button><button type="button" class="danger" id="clearBtn" data-i18n="clearChat"></button></div>
     </header>
     <div class="notice hidden" id="offNotice" data-i18n="offNotice"></div>
     <div id="msgs" class="msgs"></div>
     <form id="form" class="composer">
-      <button class="btn ghost" type="button" id="attach" data-i18n-title="sendFile">📎</button>
+      <button class="btn ghost" type="button" id="attach" data-i18n-title="sendFile"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button>
       <input type="file" id="file" multiple hidden>
       <textarea id="input" rows="1" data-i18n-ph="msgPh" enterkeyhint="send"></textarea>
       <button class="btn" type="submit" data-i18n="send"></button>
@@ -1467,12 +1853,33 @@ body.v-mobile.in-chat #chatPane{display:flex}
   </div>
 </section>
 
+<div class="modal hidden" id="locModal">
+  <div class="mcard" style="text-align:left">
+    <h3 data-i18n="locTitle" style="text-align:center"></h3>
+    <div id="locBody" class="locbody"></div>
+    <button class="primary secondary" type="button" id="locClose" data-i18n="close"></button>
+  </div>
+</div>
+<div class="modal hidden" id="confirmModal">
+  <div class="mcard">
+    <h3 id="confirmTitle"></h3>
+    <p id="confirmBody"></p>
+    <div class="row"><button class="primary secondary" type="button" id="confirmNo" data-i18n="cancel"></button>
+      <button class="primary danger" type="button" id="confirmYes" data-i18n="del"></button></div>
+  </div>
+</div>
 <div class="modal hidden" id="phoneModal">
   <div class="mcard">
     <h3 data-i18n="phoneTitle"></h3>
     <p data-i18n-html="phoneHelp"></p>
     <div id="phoneList"></div>
     <button class="primary" type="button" id="phoneClose" data-i18n="close"></button>
+  </div>
+</div>
+<div class="drawer hidden" id="drawer">
+  <div class="dpanel">
+    <header class="dhead"><button class="back" id="drawerBack" type="button">‹</button><div class="dtitle" data-i18n="filesTitle" style="flex:1"></div><button class="tbtn" id="drawerLocBtn" type="button" data-i18n="folderBtn"></button></header>
+    <div class="dbody" id="drawerBody"></div>
   </div>
 </div>
 <div class="drop" id="drop" data-i18n="drop"></div>
@@ -1488,6 +1895,16 @@ const SYS_LANG = 'en';   // 기본 언어: 영어 (한국어는 언어 선택에
 let LANG = SYS_LANG;
 const I18N = {
   ko: {
+    saveLocBtn:'📂 저장 위치', locTitle:'📂 파일 저장 위치',
+    locAndroid:'<span class="path">내 파일 → 다운로드 (Download)</span>저장한 파일은 폰의 <b>다운로드</b> 폴더에 들어갑니다.<ol><li><b>내 파일</b>(삼성) 또는 <b>Files</b>(구글) 앱을 엽니다</li><li><b>다운로드</b>를 누릅니다</li></ol><span class="hint">브라우저 설정에서 저장 위치를 바꿨다면 그 폴더에 있습니다. 저장 직후 뜨는 다운로드 알림을 눌러도 바로 열립니다.</span>',
+    locIOS:'<span class="path">파일 앱 → iCloud Drive → 다운로드</span>저장한 파일은 <b>파일</b> 앱의 <b>다운로드</b> 폴더에 들어갑니다.<ol><li><b>파일</b> 앱을 엽니다</li><li><b>둘러보기 → iCloud Drive(또는 나의 iPhone) → 다운로드</b></li></ol><span class="hint">사진은 파일 대신 사진을 길게 눌러 <b>사진 앱에 저장</b>할 수도 있습니다. 저장 위치는 설정 → Safari → 다운로드에서 바꿀 수 있습니다.</span>',
+    locDesktop:'<span class="path">브라우저의 다운로드 폴더</span>보통 <b>다운로드</b> 폴더에 저장됩니다. 브라우저에서 <b>Ctrl+J</b>(Mac은 ⌥⌘L)를 누르면 다운로드 목록과 폴더를 바로 열 수 있습니다.',
+    tipTitle:'<b>가장 빠른 방법: 브라우저의 다운로드 목록</b><br>', tipChrome:'Chrome 오른쪽 위 <b>⋮ → 다운로드</b>를 누르면 받은 파일 목록이 나오고, 누르면 바로 열립니다.',
+    tipSamsung:'삼성 인터넷 아래쪽 <b>☰ → 다운로드 기록</b>을 누르면 받은 파일 목록이 나오고, 누르면 바로 열립니다.',
+    tipFirefox:'Firefox <b>⋮ → 다운로드</b>를 누르면 받은 파일 목록이 나옵니다.',
+    tipSafari:'주소창 왼쪽의 <b>가가(aA) 버튼 → 다운로드</b>를 누르면 받은 파일 목록이 나오고, 누르면 바로 열립니다.',
+    filesMenu:'📁 사진·파일', filesTitle:'사진·파일', photos:'사진', filesSec:'파일', noFiles:'아직 주고받은 파일이 없습니다', fromMe:'보냄', fromThem:'받음',
+    clearChat:'🗑 대화 내용 삭제', clearTitle:'대화 내용을 삭제할까요?', clearBody:'{name}님과의 모든 메시지가 이 기기에서 삭제됩니다. 상대방의 대화 내용은 그대로 남고, 받은 파일 폴더에 저장된 파일도 지워지지 않습니다.', cancel:'취소', del:'삭제', noMsgs:'메시지가 없습니다',
     reconnecting:'연결이 끊어졌습니다. 다시 연결하는 중…', regHelp:'이 기기에서 사용할 이름을 입력하세요.<br>다른 사람의 목록에 이 이름으로 표시됩니다.',
     regPh:'예: 내 폰', start:'시작하기', rename:'이름 바꾸기', online:'온라인', away:'자리 비움', busy:'다른 용무 중',
     busyMute:'다른 용무 중 (알림음 끔)', offline:'오프라인', notePh:'상태 메시지 입력', phoneBtn:'📱 폰 연결', folderBtn:'📂 받은 파일',
@@ -1501,6 +1918,16 @@ const I18N = {
     otherAddr:'다른 네트워크 주소', noAddr:'네트워크 주소를 찾지 못했습니다. Wi-Fi/LAN 연결을 확인하세요.'
   },
   en: {
+    saveLocBtn:'📂 Save location', locTitle:'📂 Where files are saved',
+    locAndroid:'<span class="path">Files → Downloads</span>Files you save go to your phone\'s <b>Download</b> folder.<ol><li>Open <b>My Files</b> (Samsung) or <b>Files</b> (Google)</li><li>Tap <b>Downloads</b></li></ol><span class="hint">If you changed the download location in your browser settings, look there. You can also tap the download notification right after saving.</span>',
+    locIOS:'<span class="path">Files → iCloud Drive → Downloads</span>Files you save go to the <b>Downloads</b> folder in the <b>Files</b> app.<ol><li>Open the <b>Files</b> app</li><li><b>Browse → iCloud Drive (or On My iPhone) → Downloads</b></li></ol><span class="hint">For photos, you can also long-press the photo and choose <b>Save to Photos</b>. The location can be changed in Settings → Safari → Downloads.</span>',
+    locDesktop:'<span class="path">Your browser\'s Downloads folder</span>Files are usually saved to <b>Downloads</b>. Press <b>Ctrl+J</b> (⌥⌘L on Mac) in your browser to open the download list and folder.',
+    tipTitle:'<b>Fastest way: your browser\'s download list</b><br>', tipChrome:'In Chrome, tap <b>⋮ → Downloads</b> to see the files you saved. Tap one to open it.',
+    tipSamsung:'In Samsung Internet, tap <b>☰ → Download history</b> to see the files you saved. Tap one to open it.',
+    tipFirefox:'In Firefox, tap <b>⋮ → Downloads</b> to see the files you saved.',
+    tipSafari:'Tap the <b>aA button → Downloads</b> in the address bar to see the files you saved. Tap one to open it.',
+    filesMenu:'📁 Photos & files', filesTitle:'Photos & files', photos:'Photos', filesSec:'Files', noFiles:'No files shared yet', fromMe:'Sent', fromThem:'Received',
+    clearChat:'🗑 Delete chat history', clearTitle:'Delete chat history?', clearBody:'All messages with {name} will be deleted from this device. {name} keeps their copy, and files already saved to your Received files folder are not deleted.', cancel:'Cancel', del:'Delete', noMsgs:'No messages',
     reconnecting:'Connection lost. Reconnecting…', regHelp:'Enter a name for this device.<br>Others will see you by this name.',
     regPh:'e.g. My Phone', start:'Start', rename:'Rename', online:'Online', away:'Away', busy:'Busy',
     busyMute:'Busy (mute sounds)', offline:'Offline', notePh:'Set a status message', phoneBtn:'📱 Connect phone', folderBtn:'📂 Received files',
@@ -1548,8 +1975,8 @@ let stick = true;
 function esc(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function linkify(s){ return esc(s).replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>'); }
 function fmtSize(n){ if (n < 1024) return n + ' B'; const u=['KB','MB','GB','TB']; let i=-1; do { n/=1024; i++; } while (n>=1024 && i<u.length-1); return n.toFixed(n<10?1:0)+' '+u[i]; }
-function fmtTime(ts){ return new Date(ts).toLocaleTimeString(LOCALE,{hour:'2-digit',minute:'2-digit'}); }
-function fmtDay(ts){ return new Date(ts).toLocaleDateString(LOCALE,{year:'numeric',month:'long',day:'numeric',weekday:'short'}); }
+function fmtTime(ts){ return new Date(ts).toLocaleTimeString(LOCALE,{hour:'numeric',minute:'2-digit'}); }
+function fmtDay(ts){ return new Date(ts).toLocaleDateString(LOCALE,{year:'numeric',month:'long',day:'numeric',weekday:'long'}); }
 function hue(s){ let h=0; for (const c of String(s)) h=(h*31+c.charCodeAt(0))>>>0; return h%360; }
 function avatar(el, u, withDot){
   el.style.background = 'hsl('+hue(u.uid)+' 55% 52%)';
@@ -1599,6 +2026,8 @@ function start(d){
   if (VIEW !== 'chat') $('#listPane').classList.remove('hidden');
   $('#chatPane').classList.remove('hidden');
   if (IS_DESK) $('#phoneBtn').classList.remove('hidden');
+  else $('#saveLocBtn').classList.remove('hidden');
+  if (!native){ $('#drawerLocBtn').dataset.i18n = 'saveLocBtn'; $('#drawerLocBtn').textContent = T('saveLocBtn'); }
   setLang(me.lang, false); applyLang();
   if (native) $('#folderBtn').classList.remove('hidden');
   renderMe(); renderContacts();
@@ -1623,6 +2052,8 @@ function handle(ev){
     me = ev.me; contacts = ev.contacts;
     setLang(me.lang, true);
     renderMe(); renderContacts(); renderPeerHead(); updateTitle();
+  } else if (ev.t === 'cleared'){
+    if (peer === ev.peer){ msgs.clear(); list.innerHTML = ''; }
   } else if (ev.t === 'msg'){
     const m = ev.m, other = m.frm === me.uid ? m.to : m.frm, incoming = m.to === me.uid && m.frm !== me.uid;
     if (peer === other){ upsert(m); if (incoming && !document.hidden) markRead(); }
@@ -1698,6 +2129,86 @@ function openHere(uid, push){
   loadHistory(uid);
   if (!matchMedia('(pointer: coarse)').matches) $('#input').focus();
 }
+/* ---------------------------------------------------------------- chat menu / delete */
+const chatMenu = $('#chatMenu');
+$('#menuBtn').addEventListener('click', e => { e.stopPropagation(); chatMenu.classList.toggle('hidden'); });
+document.addEventListener('click', e => { if (!chatMenu.contains(e.target)) chatMenu.classList.add('hidden'); });
+function openDrawer(){
+  chatMenu.classList.add('hidden');
+  if (!peer) return;
+  const files = [...msgs.values()].filter(m => m.type === 'file').sort((a, b) => b.ts - a.ts);
+  const imgs = files.filter(m => /^image\/(png|jpe?g|gif|webp|bmp|avif)$/.test(m.mime || ''));
+  const others = files.filter(m => !imgs.includes(m));
+  let h = '';
+  if (!files.length) h = '<div class="dempty">' + T('noFiles') + '</div>';
+  if (imgs.length) h += '<div class="dsec">' + T('photos') + ' ' + imgs.length + '</div><div class="grid3">' +
+    imgs.map(m => '<a href="/files/' + m.fid + '" target="_blank" rel="noopener" data-act="view" data-fid="' + m.fid + '"><img src="/files/' + m.fid + '" loading="lazy" alt=""></a>').join('') + '</div>';
+  if (others.length) h += '<div class="dsec">' + T('filesSec') + ' ' + others.length + '</div>' +
+    others.map(m => '<div class="frow"><span class="fic">' + fileIcon(m) + '</span><div class="fi"><div class="fn">' + esc(m.fname) +
+      '</div><div class="fm">' + fmtSize(m.size) + ' · ' + (m.frm === me.uid ? T('fromMe') : T('fromThem')) + ' · ' + fmtDay(m.ts) + '</div>' + fileActs(m) + '</div></div>').join('');
+  $('#drawerBody').innerHTML = h;
+  $('#drawer').classList.remove('hidden');
+}
+function closeDrawer(){ $('#drawer').classList.add('hidden'); }
+
+/* ---------------------------------------------------------------- 저장 위치 (폰) */
+function platform(){
+  const u = navigator.userAgent;
+  if (/Android/i.test(u)) return 'android';
+  if (/iPhone|iPad|iPod/.test(u) || (/Macintosh/.test(u) && navigator.maxTouchPoints > 1)) return 'ios';
+  return 'desktop';
+}
+function browserTip(){
+  const u = navigator.userAgent;
+  if (/SamsungBrowser/i.test(u)) return 'tipSamsung';
+  if (/Firefox|FxiOS/i.test(u)) return 'tipFirefox';
+  if (/CriOS/i.test(u)) return 'tipChrome';
+  if (platform() === 'ios') return 'tipSafari';
+  if (/Chrome/i.test(u)) return 'tipChrome';
+  return '';
+}
+function showSaveLocation(){
+  if (native){ window.pywebview.api.open_recv_dir(); return; }   // PC 앱: 받은 파일 폴더를 바로 엶
+  const pf = platform(), tip = browserTip();
+  let body = '';
+  if (pf !== 'desktop' && tip) body += '<div class="tipbox">' + T('tipTitle') + T(tip) + '</div>';
+  body += T(pf === 'android' ? 'locAndroid' : pf === 'ios' ? 'locIOS' : 'locDesktop');
+  $('#locBody').innerHTML = body;
+  $('#locModal').classList.remove('hidden');
+}
+$('#saveLocBtn').addEventListener('click', showSaveLocation);
+$('#drawerLocBtn').addEventListener('click', showSaveLocation);
+$('#locClose').onclick = () => $('#locModal').classList.add('hidden');
+$('#locModal').onclick = e => { if (e.target.id === 'locModal') $('#locModal').classList.add('hidden'); };
+$('#filesBtn').addEventListener('click', openDrawer);
+$('#drawerBack').addEventListener('click', closeDrawer);
+$('#drawer').addEventListener('click', e => {
+  if (e.target.id === 'drawer') return closeDrawer();
+  const t = e.target.closest('[data-act]'); if (!t) return;
+  if (native && NATIVE()){
+    e.preventDefault();
+    if (t.dataset.act === 'folder') window.pywebview.api.show_file(t.dataset.fid); else window.pywebview.api.open_file(t.dataset.fid);
+  }
+});
+
+$('#clearBtn').addEventListener('click', () => {
+  chatMenu.classList.add('hidden');
+  if (!peer) return;
+  const name = (peerInfo && peerInfo.name) || '';
+  $('#confirmTitle').textContent = T('clearTitle');
+  $('#confirmBody').textContent = T('clearBody').split('{name}').join(name);
+  $('#confirmModal').classList.remove('hidden');
+});
+$('#confirmNo').onclick = () => $('#confirmModal').classList.add('hidden');
+$('#confirmModal').onclick = e => { if (e.target.id === 'confirmModal') $('#confirmModal').classList.add('hidden'); };
+$('#confirmYes').onclick = async () => {
+  $('#confirmModal').classList.add('hidden');
+  const p = peer;
+  try { await api('/api/clear', {json:{peer: p}}); if (peer === p){ msgs.clear(); list.innerHTML = ''; } }
+  catch (e) { alert(e.message); }
+};
+document.addEventListener('keydown', e => { if (e.key === 'Escape'){ chatMenu.classList.add('hidden'); $('#confirmModal').classList.add('hidden'); closeDrawer(); } });
+
 function closeChat(){
   peer = null; document.body.classList.remove('in-chat');
   $('#chatMain').classList.add('hidden'); $('#chatEmpty').classList.remove('hidden');
@@ -1745,34 +2256,58 @@ const list = $('#msgs');
 list.addEventListener('scroll', () => { stick = list.scrollHeight - list.scrollTop - list.clientHeight < 80; });
 function toBottom(){ list.scrollTop = list.scrollHeight; }
 
+function canInline(m){ const t = m.mime || ''; return (/^(image|video|audio)\//.test(t) && t !== 'image/svg+xml') || t === 'application/pdf'; }
 function fileActs(m){
   if (native) return '<span class="facts"><button type="button" data-act="open" data-fid="'+m.fid+'">'+T('open')+'</button><button type="button" data-act="folder" data-fid="'+m.fid+'">'+T('showFolder')+'</button></span>';
-  return '<span class="facts"><a href="/files/'+m.fid+'?dl=1" download="'+esc(m.fname)+'">'+T('save')+'</a></span>';
+  return '<span class="facts">' + (canInline(m) ? '<a href="/files/'+m.fid+'" target="_blank" rel="noopener">'+T('open')+'</a>' : '') +
+    '<a href="/files/'+m.fid+'?dl=1" download="'+esc(m.fname)+'">'+T('save')+'</a></span>';
 }
 function msgEl(m){
   const mine = m.frm === me.uid;
   const el = document.createElement('div');
   el.className = 'msg' + (mine ? ' me' : '');
-  el.dataset.mid = m.mid; el.dataset.ts = m.ts;
+  el.dataset.mid = m.mid; el.dataset.ts = m.ts; el.dataset.frm = m.frm;
   let st = '';
-  if (mine && m.st === 'pending') st = ' · ' + T('pending');
-  if (mine && m.st === 'failed') st = ' · <span class="bad">' + T('failed') + '</span>';
-  let h = '<div class="meta">' + esc(mine ? me.name : m.frm_name) + ' · ' + fmtTime(m.ts) + st + '</div>';
+  if (mine && m.st === 'pending') st = '<span class="st">' + T('pending') + '</span>';
+  if (mine && m.st === 'failed') st = '<span class="bad">' + T('failed') + '</span>';
+  const side = '<div class="side">' + st + '<span class="tm">' + fmtTime(m.ts) + '</span></div>';
+  let bubble, below = '';
   if (m.type === 'file'){
     const img = /^image\/(png|jpe?g|gif|webp|bmp|avif)$/.test(m.mime || '');
     if (img){
-      h += '<div class="bubble imgb"><img src="/files/' + m.fid + '" alt="" loading="lazy" data-act="view" data-fid="' + m.fid + '"></div>' +
-           '<div class="fline"><span>' + esc(m.fname) + ' · ' + fmtSize(m.size) + '</span>' + fileActs(m) + '</div>';
+      bubble = '<div class="bubble imgb"><img src="/files/' + m.fid + '" alt="" loading="lazy" data-act="view" data-fid="' + m.fid + '"></div>';
+      below = '<div class="fline"><span>' + esc(m.fname) + ' · ' + fmtSize(m.size) + '</span>' + fileActs(m) + '</div>';
     } else {
-      h += '<div class="bubble filebox"><span class="fic">' + fileIcon(m) + '</span><div><div class="fn">' + esc(m.fname) +
-           '</div><div class="fs">' + fmtSize(m.size) + '</div>' + fileActs(m) + '</div></div>';
+      bubble = '<div class="bubble filebox"><span class="fic">' + fileIcon(m) + '</span><div><div class="fn">' + esc(m.fname) +
+               '</div><div class="fs">' + fmtSize(m.size) + '</div>' + fileActs(m) + '</div></div>';
     }
   } else {
-    h += '<div class="bubble">' + linkify(m.text) + '</div>';
+    bubble = '<div class="bubble">' + linkify(m.text) + '</div>';
   }
-  el.innerHTML = h;
+  el.innerHTML = '<div class="pav" style="background:hsl(' + hue(m.frm) + ' 55% 52%)">' + esc((m.frm_name || '?').trim().charAt(0).toUpperCase()) + '</div>' +
+    '<div class="mcol"><div class="pname2">' + esc(m.frm_name || '') + '</div><div class="line">' + bubble + side + '</div>' + below + '</div>';
   el.querySelectorAll('img').forEach(i => i.addEventListener('load', () => { if (stick) toBottom(); }));
   return el;
+}
+/* 같은 사람이 같은 분에 연달아 보낸 메시지를 묶음: 첫 메시지에 프로필/이름, 마지막 메시지에 시간 */
+function minuteKey(el){ const d = new Date(+el.dataset.ts); d.setSeconds(0, 0); return el.dataset.frm + '|' + d.getTime(); }
+let regroupQueued = false;
+function regroup(){
+  if (regroupQueued) return;
+  regroupQueued = true;
+  requestAnimationFrame(() => {
+    regroupQueued = false;
+    const kids = [...list.children];
+    kids.forEach((el, i) => {
+      if (!el.classList.contains('msg')) return;
+      const prev = kids[i - 1], next = kids[i + 1];
+      const k = minuteKey(el);
+      const samePrev = prev && prev.classList.contains('msg') && minuteKey(prev) === k;
+      const sameNext = next && next.classList.contains('msg') && minuteKey(next) === k;
+      el.classList.toggle('first', !samePrev);
+      el.classList.toggle('last', !sameNext);
+    });
+  });
 }
 function dayKey(ts){ return new Date(ts).toDateString(); }
 function upsert(m){
@@ -1782,7 +2317,7 @@ function upsert(m){
     if (old.st && old.st !== 'pending' && m.st === 'pending') m = Object.assign({}, m, {st: old.st});
     msgs.set(m.mid, m);
     const cur = list.querySelector('[data-mid="' + m.mid + '"]');
-    if (cur){ cur.replaceWith(msgEl(m)); return; }
+    if (cur){ cur.replaceWith(msgEl(m)); regroup(); return; }
   }
   msgs.set(m.mid, m);
   const el = msgEl(m);
@@ -1800,6 +2335,7 @@ function upsert(m){
     list.insertBefore(d, anchor);
   }
   list.insertBefore(el, anchor);
+  regroup();
   if (wasStick || m.frm === me.uid) toBottom();
 }
 list.addEventListener('click', e => {
@@ -1826,7 +2362,11 @@ $('#form').addEventListener('submit', e => { e.preventDefault(); sendText(); if 
 input.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !matchMedia('(pointer: coarse)').matches){ e.preventDefault(); sendText(); }
 });
-function autosize(){ input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 140) + 'px'; }
+function autosize(){
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 140) + 'px';
+  input.style.overflowY = input.scrollHeight > 140 ? 'auto' : 'hidden';
+}
 input.addEventListener('input', autosize);
 
 function upload(file){

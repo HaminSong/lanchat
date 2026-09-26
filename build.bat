@@ -9,13 +9,13 @@ echo ==================================================
 if /i "%~1"=="installer" goto :step3
 
 echo.
-echo [1/3] Installing packages (pywebview, segno, pyinstaller)...
-py -m pip install --upgrade pywebview segno pyinstaller
+echo [1/3] Installing packages (pywebview, pystray, pillow, segno, pyinstaller)...
+py -m pip install --upgrade pywebview pystray pillow segno pyinstaller
 if errorlevel 1 goto :err
 
 echo.
 echo [2/3] Building app...
-py -m PyInstaller --noconfirm --clean --windowed --onedir --name LANChat --icon app.ico --version-file version_info.txt lanchat.py
+py -m PyInstaller --noconfirm --clean --windowed --onedir --name LANChat --icon app.ico --version-file version_info.txt --hidden-import pystray._win32 lanchat.py
 if errorlevel 1 goto :err
 
 :step3
