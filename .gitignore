@@ -1,0 +1,10 @@
+# 빌드 결과물
+build/
+dist/
+installer/
+*.spec
+
+# 실행 데이터 / 캐시
+lanchat_data/
+__pycache__/
+*.pyc

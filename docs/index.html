@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LAN Chat - Free LAN messenger for PCs and phones on the same Wi-Fi</title>
+<meta name="description" content="LAN Chat is a free, serverless LAN messenger. Chat and send files between Windows PCs and phones on the same Wi-Fi or local network. No server, no sign-up, no internet required. Phones join from the browser by scanning a QR code.">
+<meta name="keywords" content="LAN messenger, local network chat, offline messenger, Wi-Fi file transfer, PC to phone file transfer, serverless chat, office messenger, LAN chat">
+<link rel="canonical" href="https://haminsong.github.io/lanchat/">
+<link rel="icon" href="images/icon.png">
+<meta property="og:type" content="website">
+<meta property="og:title" content="LAN Chat - Chat on your local network">
+<meta property="og:description" content="Chat and share files between PCs and phones on the same Wi-Fi. No server, no sign-up, no internet.">
+<meta property="og:image" content="https://haminsong.github.io/lanchat/images/og.png">
+<meta property="og:url" content="https://haminsong.github.io/lanchat/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#3b6ef5">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"LAN Chat","operatingSystem":"Windows 10, Windows 11","applicationCategory":"CommunicationApplication","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"downloadUrl":"https://github.com/HaminSong/lanchat/releases/latest/download/LANChat-Setup.exe","image":"https://haminsong.github.io/lanchat/images/icon.png"}
+</script>
+<style>
+:root{
+  --bg:#ffffff; --bg2:#f4f6fa; --text:#15181e; --muted:#5d6572; --line:#e3e7ee;
+  --accent:#3b6ef5; --accent2:#2a55d6; --card:#ffffff; --hero1:#4c7dff; --hero2:#2852dc;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#101216; --bg2:#171a20; --text:#e9ecf1; --muted:#9aa2ae; --line:#272b33; --card:#1b1e25; }
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);line-height:1.6;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+a{color:var(--accent)}
+.wrap{max-width:1080px;margin:0 auto;padding:0 20px}
+
+/* nav */
+nav{position:sticky;top:0;z-index:10;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+nav .wrap{display:flex;align-items:center;gap:10px;height:60px}
+nav .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px;color:var(--text);text-decoration:none;flex:1}
+nav .brand img{width:32px;height:32px}
+nav .links{display:flex;gap:18px;font-size:14px}
+nav .links a{color:var(--muted);text-decoration:none}
+nav .links a:hover{color:var(--text)}
+
+/* hero */
+.hero{background:linear-gradient(160deg,var(--hero1),var(--hero2));color:#fff;overflow:hidden}
+.hero .wrap{display:grid;grid-template-columns:1.05fr 1fr;gap:40px;align-items:center;padding-top:64px;padding-bottom:64px}
+.hero h1{font-size:44px;line-height:1.25;margin:0 0 16px;letter-spacing:-.02em}
+.hero p.lead{font-size:18px;margin:0 0 28px;color:#e3eaff}
+.cta{display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+.btn{display:inline-flex;align-items:center;gap:10px;padding:14px 22px;border-radius:12px;font-weight:700;font-size:16px;text-decoration:none;transition:transform .15s,box-shadow .15s}
+.btn.main{background:#fff;color:var(--accent2);box-shadow:0 8px 24px rgba(0,0,40,.25)}
+.btn.main:hover{transform:translateY(-2px);box-shadow:0 12px 28px rgba(0,0,40,.3)}
+.btn.sub{color:#fff;border:1px solid rgba(255,255,255,.5)}
+.btn.sub:hover{background:rgba(255,255,255,.1)}
+.btn svg{width:20px;height:20px}
+.meta{font-size:13px;color:#cdd8ff;margin-top:14px}
+.shots{position:relative;height:460px}
+.shots img{position:absolute;border-radius:18px;box-shadow:0 24px 50px rgba(0,0,40,.35)}
+.shots .s1{width:62%;left:0;top:0}
+.shots .s2{width:44%;right:0;top:70px}
+
+/* sections */
+section{padding:72px 0}
+section.alt{background:var(--bg2)}
+h2{font-size:30px;margin:0 0 10px;letter-spacing:-.01em;text-align:center}
+.sub-h{color:var(--muted);text-align:center;margin:0 0 40px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:22px}
+.card .ic{font-size:26px;width:48px;height:48px;border-radius:12px;display:flex;align-items:center;justify-content:center;background:color-mix(in srgb,var(--accent) 12%,transparent);margin-bottom:12px}
+.card h3{margin:0 0 6px;font-size:17px}
+.card p{margin:0;color:var(--muted);font-size:14.5px}
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;counter-reset:s}
+.step{position:relative;padding:22px 22px 22px 22px;border-radius:16px;background:var(--card);border:1px solid var(--line)}
+.step::before{counter-increment:s;content:counter(s);display:flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:50%;background:var(--accent);color:#fff;font-weight:800;margin-bottom:12px}
+.step h3{margin:0 0 6px;font-size:17px}
+.step p{margin:0;color:var(--muted);font-size:14.5px}
+.gallery{display:grid;grid-template-columns:1fr 1.3fr 1fr;gap:20px;align-items:start}
+.gallery figure{margin:0;text-align:center}
+.gallery img{width:100%;border-radius:14px;border:1px solid var(--line);box-shadow:0 10px 30px rgba(0,0,0,.08)}
+.gallery figcaption{font-size:13px;color:var(--muted);margin-top:8px}
+.faq{max-width:760px;margin:0 auto}
+details{border:1px solid var(--line);border-radius:12px;background:var(--card);margin-bottom:10px;padding:0 18px}
+summary{cursor:pointer;font-weight:700;padding:16px 0;list-style:none}
+summary::-webkit-details-marker{display:none}
+summary::after{content:"＋";float:right;color:var(--muted)}
+details[open] summary::after{content:"－"}
+details p,details ul{margin:0 0 16px;color:var(--muted);font-size:14.5px}
+details ul{padding-left:20px}
+.final{text-align:center}
+.final .btn.main{background:var(--accent);color:#fff}
+.final .meta{color:var(--muted)}
+footer{border-top:1px solid var(--line);padding:28px 0;color:var(--muted);font-size:13px}
+footer .wrap{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between}
+footer a{color:var(--muted)}
+
+@media (max-width:860px){
+  .hero .wrap{grid-template-columns:1fr;padding-top:44px;padding-bottom:40px}
+  .hero h1{font-size:32px}
+  .shots{height:360px;max-width:460px;width:100%;margin:0 auto}
+  .grid,.steps{grid-template-columns:1fr}
+  .gallery{grid-template-columns:1fr;max-width:420px;margin:0 auto}
+  nav .links{display:none}
+  .hero p.lead br{display:none}
+  section{padding:52px 0}
+  h2{font-size:24px}
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#"><img src="images/icon.png" alt="">LAN Chat</a>
+    <div class="links">
+      <a href="#features">Features</a><a href="#how">How it works</a><a href="#faq">FAQ</a>
+      <a href="https://github.com/HaminSong/lanchat">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <div>
+      <h1>Chat across your<br>Wi-Fi, instantly</h1>
+      <p class="lead">No server, no sign-up, no internet.<br>Install it and every PC and phone on your network shows up automatically, ready to chat and share files.</p>
+      <div class="cta">
+        <a class="btn main" href="https://github.com/HaminSong/lanchat/releases/latest/download/LANChat-Setup.exe"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 5.5 10.5 4.4v7.1H3zm0 13L10.5 19.6v-7.1H3zm8.5 1.2L21 21V12.5h-9.5zm0-15.4v7.2H21V3z"/></svg>Download for Windows</a>
+        <a class="btn sub" href="#how">See how it works</a>
+      </div>
+      <div class="meta">Free · Windows 10 / 11 (64-bit) · Phones join from the browser · <a href="https://github.com/HaminSong/lanchat/releases" style="color:#fff">All releases</a></div>
+    </div>
+    <div class="shots" aria-hidden="true">
+      <img class="s1" src="images/shot-chat.png" alt="">
+      <img class="s2" src="images/shot-phone.png" alt="">
+    </div>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <h2>Everything you need, nothing you don't</h2>
+    <p class="sub-h">All it takes is one router at home or in the office.</p>
+    <div class="grid">
+      <div class="card"><div class="ic">🔍</div><h3>Finds everyone automatically</h3><p>PCs and phones running LAN Chat on the same network appear in your list. No IP addresses, no server setup.</p></div>
+      <div class="card"><div class="ic">💬</div><h3>One window per conversation</h3><p>Click a contact to open a chat window. New messages pop up with a sound, unless you set yourself to Busy.</p></div>
+      <div class="card"><div class="ic">📎</div><h3>Files and photos</h3><p>Drag and drop, paste, or attach. Received files are saved to <b>Documents\LAN Chat</b> with their original names.</p></div>
+      <div class="card"><div class="ic">📱</div><h3>Phones included</h3><p>Scan the QR code from any PC and you're in. Nothing to install. Add it to your home screen to use it like an app.</p></div>
+      <div class="card"><div class="ic">📨</div><h3>Delivered when they're back</h3><p>If the other PC is off, your message waits and is delivered the moment it comes back online.</p></div>
+      <div class="card"><div class="ic">🔒</div><h3>Stays on your network</h3><p>Messages and files travel only inside your local network and are never stored on an outside server.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="how" class="alt">
+  <div class="wrap">
+    <h2>Up and running in 3 steps</h2>
+    <p class="sub-h">You only need to set it up once.</p>
+    <div class="steps">
+      <div class="step"><h3>Install</h3><p>Run the installer. It creates a desktop shortcut and sets up the firewall for you.</p></div>
+      <div class="step"><h3>Install on other PCs</h3><p>Install it on other PCs connected to the same router. They'll find each other automatically.</p></div>
+      <div class="step"><h3>Connect a phone (optional)</h3><p>Click <b>📱 Connect phone</b> on a PC, scan the QR code with your phone camera and enter a name.</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Take a look</h2>
+    <p class="sub-h">A lightweight window on PC, the same interface in your phone's browser.</p>
+    <div class="gallery">
+      <figure><img src="images/shot-list.png" alt="LAN Chat contact list" loading="lazy"><figcaption>Contacts and status messages</figcaption></figure>
+      <figure><img src="images/shot-chat.png" alt="LAN Chat chat window sending a photo and a PDF" loading="lazy"><figcaption>Chat window with photos and files</figcaption></figure>
+      <figure><img src="images/shot-phone.png" alt="LAN Chat in a phone browser" loading="lazy"><figcaption>On a phone, no install needed</figcaption></figure>
+    </div>
+  </div>
+</section>
+
+<section id="faq" class="alt">
+  <div class="wrap">
+    <h2>FAQ</h2>
+    <p class="sub-h">&nbsp;</p>
+    <div class="faq">
+      <details><summary>Windows says “Windows protected your PC” when I install.</summary>
+        <p>The installer isn't signed with a paid code-signing certificate, so Windows shows this notice. Click <b>More info → Run anyway</b> to continue. The full source code is available on GitHub.</p></details>
+      <details><summary>Other PCs or my phone don't show up.</summary>
+        <ul>
+          <li>Make sure both devices are connected to <b>the same router / Wi-Fi</b>.</li>
+          <li>In Windows Settings → Network &amp; internet, set your network profile to <b>Private</b>. On Public networks the firewall blocks connections.</li>
+          <li>Some public and corporate Wi-Fi networks block device-to-device traffic.</li>
+        </ul></details>
+      <details><summary>Does it work without internet?</summary>
+        <p>Yes. As long as the devices are on the same local network, no internet connection is needed.</p></details>
+      <details><summary>Where are my messages and files stored?</summary>
+        <p>Received files go to <b>Documents\LAN Chat</b>, and chat history is kept on each PC in <code>%APPDATA%\LANChat</code>. Nothing is sent to an outside server.</p></details>
+      <details><summary>How do phones work? Is iPhone supported?</summary>
+        <p>Both Android and iPhone work. Scan the QR code from a PC and LAN Chat opens in your browser. A phone can chat while the PC it joined through is on; messages that arrive while it's away are waiting when you reconnect.</p></details>
+      <details><summary>What about Mac or Linux?</summary>
+        <p>The installer is for Windows. On Mac or Linux you can join from the browser just like a phone, or run it from source with Python.</p></details>
+    </div>
+  </div>
+</section>
+
+<section class="final">
+  <div class="wrap">
+    <h2>Try it now</h2>
+    <p class="sub-h">Free and open source (MIT)</p>
+    <a class="btn main" href="https://github.com/HaminSong/lanchat/releases/latest/download/LANChat-Setup.exe"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 5.5 10.5 4.4v7.1H3zm0 13L10.5 19.6v-7.1H3zm8.5 1.2L21 21V12.5h-9.5zm0-15.4v7.2H21V3z"/></svg>Download for Windows</a>
+    <div class="meta">Windows 10 / 11 (64-bit)</div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>© 2026 LAN Chat contributors · MIT License</span>
+    <span><a href="https://github.com/HaminSong/lanchat">GitHub</a> · <a href="https://github.com/HaminSong/lanchat/issues">Report an issue</a> · <a href="https://github.com/HaminSong/lanchat/releases">Release notes</a></span>
+  </div>
+</footer>
+
+</body>
+</html>
