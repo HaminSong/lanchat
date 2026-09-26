@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://haminsong.github.io/lanchat/sitemap.xml
